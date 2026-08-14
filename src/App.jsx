@@ -622,7 +622,22 @@ function uid() {
 
 /* ---------------------------- STORAGE HOOK ---------------------------- */
 
-const DEFAULT_STATE = { notes: {}, bookmarks: [], researchQueue: [] };
+const WAGE_SOURCE_META = [
+  { key: "aewr", label: "AEWR", hasNA: false, url: "https://flag.dol.gov/wage-data/adverse-effect-wage-rates", sourceLabel: "DOL / FLAG" },
+  { key: "prevailing", label: "Applicable Prevailing Wage", hasNA: true, url: "https://flag.dol.gov/wage-data/wage-search", sourceLabel: "DOL Agricultural Online Wage Library" },
+  { key: "federalMin", label: "Federal Minimum Wage", hasNA: false, url: "https://www.dol.gov/agencies/whd/minimum-wage", sourceLabel: "U.S. Department of Labor" },
+  { key: "mnMin", label: "Minnesota Minimum Wage", hasNA: false, url: "https://www.dli.mn.gov/business/employment-practices/minimum-wage-minnesota", sourceLabel: "Minnesota Department of Labor and Industry" },
+  { key: "local", label: "Local Minimum Wage", hasNA: true, hasJurisdiction: true, url: "", sourceLabel: "Local government source (editable)" },
+];
+
+const WAGE_TRACKER_DEFAULT = {
+  sources: Object.fromEntries(WAGE_SOURCE_META.map((s) => [s.key, { rate: "", na: false, effectiveDate: "", lastChecked: "", jurisdiction: "", sourceUrl: s.url }])),
+  jobOrder: { rate: "", reference: "", period: "" },
+  actualPay: { rate: "", effectiveDate: "" },
+  reviews: [],
+};
+
+const DEFAULT_STATE = { notes: {}, bookmarks: [], researchQueue: [], wageTracker: WAGE_TRACKER_DEFAULT };
 
 const STORAGE_KEY = "h2a-navigator-data";
 
@@ -1822,12 +1837,325 @@ function ResearchQueueView({ data, persist }) {
   );
 }
 
+/* ---------------------------- WAGES & COMPENSATION ---------------------------- */
+
+function num(v) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+}
+function money(n) {
+  return n === null ? "—" : `$${n.toFixed(2)}`;
+}
+
+function computeWageCompliance(t) {
+  const applicable = WAGE_SOURCE_META.map((meta) => {
+    const s = t.sources[meta.key];
+    if (meta.hasNA && s.na) return null;
+    return num(s.rate);
+  }).filter((v) => v !== null);
+  const highestApplicable = applicable.length ? Math.max(...applicable) : null;
+  const jobOrderRate = num(t.jobOrder.rate);
+  const candidates = [highestApplicable, jobOrderRate].filter((v) => v !== null);
+  const requiredWage = candidates.length ? Math.max(...candidates) : null;
+  const actualRate = num(t.actualPay.rate);
+  const difference = requiredWage !== null && actualRate !== null ? actualRate - requiredWage : null;
+  let status = "REVIEW NEEDED";
+  if (requiredWage !== null && actualRate !== null) {
+    status = actualRate >= requiredWage ? "COMPLIANT" : "ACTION REQUIRED";
+  }
+  const jobOrderControls = jobOrderRate !== null && highestApplicable !== null && jobOrderRate > highestApplicable;
+  return { highestApplicable, jobOrderRate, requiredWage, actualRate, difference, status, jobOrderControls };
+}
+
+const WAGE_STATUS_STYLE = {
+  COMPLIANT: { bg: C.tealSoft, fg: C.teal },
+  "REVIEW NEEDED": { bg: C.orangeSoft, fg: C.orange },
+  "ACTION REQUIRED": { bg: C.burgundySoft, fg: C.burgundy },
+};
+
+function LabeledInput({ label, value, onChange, placeholder, type = "text", width }) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 3, width: width || "auto" }}>
+      <span style={{ fontFamily: SANS, fontSize: 10.5, fontWeight: 700, color: C.textFaint, textTransform: "uppercase", letterSpacing: "0.03em" }}>{label}</span>
+      <input
+        type={type}
+        step={type === "number" ? "0.01" : undefined}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        style={{ fontFamily: SANS, fontSize: 13, padding: "6px 8px", borderRadius: 4, border: `1px solid ${C.border}`, color: C.text }}
+      />
+    </label>
+  );
+}
+
+function WageSourceRow({ meta, value, onChange }) {
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "12px 14px", marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 6 }}>
+        <span style={{ fontFamily: SERIF, fontSize: 14.5, fontWeight: 600, color: C.text }}>{meta.label}</span>
+        {value.sourceUrl || meta.url ? (
+          <a href={value.sourceUrl || meta.url} target="_blank" rel="noopener noreferrer" style={{ fontFamily: SANS, fontSize: 11, fontWeight: 700, color: C.blue, border: `1px solid ${C.blue}44`, borderRadius: 4, padding: "3px 8px" }}>
+            Check Official Source ↗
+          </a>
+        ) : null}
+      </div>
+      {meta.hasNA && (
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: SANS, fontSize: 12, color: C.textSoft, marginBottom: 8 }}>
+          <input type="checkbox" checked={value.na} onChange={(e) => onChange({ na: e.target.checked })} />
+          N/A — no applicable {meta.label.toLowerCase()} identified
+        </label>
+      )}
+      {!(meta.hasNA && value.na) && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+          <LabeledInput label="Rate ($/hr)" type="number" value={value.rate} onChange={(v) => onChange({ rate: v })} placeholder="0.00" width={110} />
+          <LabeledInput label="Effective Date" type="date" value={value.effectiveDate} onChange={(v) => onChange({ effectiveDate: v })} width={150} />
+          <LabeledInput label="Last Checked" type="date" value={value.lastChecked} onChange={(v) => onChange({ lastChecked: v })} width={150} />
+          {meta.hasJurisdiction && <LabeledInput label="Jurisdiction" value={value.jurisdiction} onChange={(v) => onChange({ jurisdiction: v })} placeholder="City / county" width={160} />}
+        </div>
+      )}
+      <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.textFaint, marginTop: 6 }}>Official source: {meta.sourceLabel}</div>
+    </div>
+  );
+}
+
+function WagesComplianceView({ data, persist, setView }) {
+  const [legalOpen, setLegalOpen] = useState(false);
+  const [whenOpen, setWhenOpen] = useState(false);
+  const t = data.wageTracker;
+  const result = computeWageCompliance(t);
+  const [record, setRecord] = useState({ date: "", reviewedBy: "", payrollVerified: "", actionRequired: "", nextReview: "", notes: "" });
+
+  function setSource(key, patch) {
+    persist({ ...data, wageTracker: { ...t, sources: { ...t.sources, [key]: { ...t.sources[key], ...patch } } } });
+  }
+  function setJobOrder(patch) {
+    persist({ ...data, wageTracker: { ...t, jobOrder: { ...t.jobOrder, ...patch } } });
+  }
+  function setActualPay(patch) {
+    persist({ ...data, wageTracker: { ...t, actualPay: { ...t.actualPay, ...patch } } });
+  }
+  function saveReview() {
+    if (!record.date) return;
+    const entry = { id: uid(), ...record, ...result };
+    persist({ ...data, wageTracker: { ...t, reviews: [entry, ...t.reviews] } });
+    setRecord({ date: "", reviewedBy: "", payrollVerified: "", actionRequired: "", nextReview: "", notes: "" });
+  }
+  function removeReview(id) {
+    persist({ ...data, wageTracker: { ...t, reviews: t.reviews.filter((r) => r.id !== id) } });
+  }
+
+  const statusStyle = WAGE_STATUS_STYLE[result.status];
+
+  return (
+    <div>
+      <H1 sub="A simple decision-support tracker: cross-check what we're actually paying against what the AEWR, applicable prevailing wage, wage floors, and the certified job order require for H-2A workers and workers in corresponding employment.">
+        Wages &amp; Compensation — H-2A Wage Compliance Tracker
+      </H1>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 18 }}>
+        {["Check sources", "Enter rates", "Compare sources", "Check job order", "Determine required wage", "Compare with actual pay", "Compliance status", "Document review"].map((s, i, arr) => (
+          <React.Fragment key={s}>
+            <Chip bg={C.navySoft} fg={C.navy} small>{i + 1}. {s}</Chip>
+            {i < arr.length - 1 && <span style={{ color: C.textFaint }}>→</span>}
+          </React.Fragment>
+        ))}
+      </div>
+
+      <SectionEyebrow>Wage Sources</SectionEyebrow>
+      {WAGE_SOURCE_META.map((meta) => (
+        <WageSourceRow key={meta.key} meta={meta} value={t.sources[meta.key]} onChange={(patch) => setSource(meta.key, patch)} />
+      ))}
+
+      <div style={{ background: C.graySoft, border: `1px solid ${C.border}`, borderRadius: 6, padding: "12px 14px", marginBottom: 8 }}>
+        <span style={{ fontFamily: SERIF, fontSize: 14.5, fontWeight: 600, color: C.text }}>CBA (Collective Bargaining Agreement)</span>
+        <p style={{ fontFamily: SANS, fontSize: 12.5, color: C.textSoft, margin: "6px 0 0" }}>
+          <strong>Current operation: N/A</strong> — no applicable collective bargaining agreement. The general highest-applicable-wage rule can include an agreed CBA rate where one exists; it is not an active input here.
+        </p>
+      </div>
+
+      <Divider />
+
+      <SectionEyebrow>Job Order Wage</SectionEyebrow>
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "12px 14px", marginBottom: 16, display: "flex", flexWrap: "wrap", gap: 10 }}>
+        <LabeledInput label="Rate ($/hr)" type="number" value={t.jobOrder.rate} onChange={(v) => setJobOrder({ rate: v })} placeholder="0.00" width={110} />
+        <LabeledInput label="Job Order / Contract Reference" value={t.jobOrder.reference} onChange={(v) => setJobOrder({ reference: v })} placeholder="e.g. Case number" width={220} />
+        <LabeledInput label="Effective Period" value={t.jobOrder.period} onChange={(v) => setJobOrder({ period: v })} placeholder="e.g. MM/DD–MM/DD" width={180} />
+      </div>
+      <p style={{ fontFamily: SANS, fontSize: 11.5, color: C.textFaint, marginTop: -10, marginBottom: 16 }}>Enter manually from the applicable certified job order. No worker-specific information is stored here.</p>
+
+      <SectionEyebrow>Actual Company Pay Rate</SectionEyebrow>
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "12px 14px", marginBottom: 20, display: "flex", flexWrap: "wrap", gap: 10 }}>
+        <LabeledInput label="Rate ($/hr)" type="number" value={t.actualPay.rate} onChange={(v) => setActualPay({ rate: v })} placeholder="0.00" width={110} />
+        <LabeledInput label="Effective Date" type="date" value={t.actualPay.effectiveDate} onChange={(v) => setActualPay({ effectiveDate: v })} width={150} />
+        <div style={{ fontFamily: SANS, fontSize: 11.5, color: C.textFaint, alignSelf: "flex-end" }}>Source: Payroll / Compensation Administration</div>
+      </div>
+
+      {/* COMPARISON */}
+      <SectionEyebrow>Comparison</SectionEyebrow>
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderLeft: `3px solid ${statusStyle.fg}`, borderRadius: 6, padding: "16px 18px", marginBottom: 20 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", rowGap: 6, columnGap: 14, fontFamily: SANS, fontSize: 13 }}>
+          {WAGE_SOURCE_META.map((meta) => (
+            <React.Fragment key={meta.key}>
+              <span style={{ color: C.textFaint, fontWeight: 600 }}>{meta.label}</span>
+              <span style={{ fontFamily: MONO }}>{meta.hasNA && t.sources[meta.key].na ? "N/A" : money(num(t.sources[meta.key].rate))}</span>
+            </React.Fragment>
+          ))}
+          <span style={{ color: C.navy, fontWeight: 700, marginTop: 6 }}>Highest Applicable Wage</span>
+          <span style={{ fontFamily: MONO, fontWeight: 700, marginTop: 6 }}>{money(result.highestApplicable)}</span>
+          <span style={{ color: C.navy, fontWeight: 700 }}>Job Order Wage</span>
+          <span style={{ fontFamily: MONO, fontWeight: 700 }}>{money(result.jobOrderRate)}</span>
+          <span style={{ color: C.navy, fontWeight: 700 }}>Required Wage</span>
+          <span style={{ fontFamily: MONO, fontWeight: 700 }}>{money(result.requiredWage)}</span>
+          <span style={{ color: C.textFaint, fontWeight: 600 }}>Actual Company Pay</span>
+          <span style={{ fontFamily: MONO }}>{money(result.actualRate)}</span>
+          <span style={{ color: C.textFaint, fontWeight: 600 }}>Difference</span>
+          <span style={{ fontFamily: MONO, color: result.difference !== null && result.difference < 0 ? C.burgundy : C.text }}>{result.difference === null ? "—" : money(result.difference)}</span>
+        </div>
+
+        {result.jobOrderControls && (
+          <p style={{ fontFamily: SANS, fontSize: 12, color: C.textSoft, marginTop: 10, fontStyle: "italic" }}>
+            The job order's promised wage is higher than the highest applicable wage source — the job order commitment may control.
+          </p>
+        )}
+
+        <div style={{ marginTop: 12 }}>
+          <Chip bg={statusStyle.bg} fg={statusStyle.fg}>{result.status}</Chip>
+        </div>
+
+        <p style={{ fontFamily: SANS, fontSize: 11, color: C.textFaint, marginTop: 12, lineHeight: 1.5, borderTop: `1px dashed ${C.borderStrong}`, paddingTop: 10 }}>
+          Compliance indicator based on rates and applicability entered by the user. Verify current official sources and applicable job-order requirements. This is a decision-support and documentation tool, not a legal determination.
+        </p>
+      </div>
+
+      {/* WHEN TO REVIEW */}
+      <button
+        onClick={() => setWhenOpen((o) => !o)}
+        style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: SANS, fontSize: 12, fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase", color: C.navy, display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}
+      >
+        <span style={{ fontSize: 10 }}>{whenOpen ? "▾" : "▸"}</span> When Should I Check This?
+      </button>
+      {whenOpen && (
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "14px 16px", marginBottom: 20, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+          <div>
+            <span style={{ fontFamily: SANS, fontSize: 11.5, fontWeight: 700, color: C.textFaint, textTransform: "uppercase" }}>Routine</span>
+            <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontFamily: SANS, fontSize: 12.5, lineHeight: 1.6 }}>
+              <li>New H-2A job order / season</li>
+              <li>Before payroll begins for the covered workforce</li>
+              <li>Periodic review during active employment</li>
+            </ul>
+          </div>
+          <div>
+            <span style={{ fontFamily: SANS, fontSize: 11.5, fontWeight: 700, color: C.textFaint, textTransform: "uppercase" }}>Event-Triggered</span>
+            <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontFamily: SANS, fontSize: 12.5, lineHeight: 1.6 }}>
+              <li>AEWR, prevailing wage, or any minimum wage changes</li>
+              <li>New or modified job order</li>
+              <li>Company pay rate changes</li>
+              <li>Any relevant wage requirement changes</li>
+            </ul>
+          </div>
+          <p style={{ gridColumn: "1 / -1", fontFamily: SANS, fontSize: 11, color: C.textFaint, marginTop: 4, fontStyle: "italic" }}>
+            These are recommended internal review triggers, not a legally mandated review frequency.
+          </p>
+        </div>
+      )}
+
+      {/* REVIEW RECORD */}
+      <SectionEyebrow>Review Record</SectionEyebrow>
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6, padding: "14px 16px", marginBottom: 12 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
+          <LabeledInput label="Review Date" type="date" value={record.date} onChange={(v) => setRecord({ ...record, date: v })} width={150} />
+          <LabeledInput label="Reviewed By" value={record.reviewedBy} onChange={(v) => setRecord({ ...record, reviewedBy: v })} placeholder="Name / role" width={170} />
+          <LabeledInput label="Next Review" type="date" value={record.nextReview} onChange={(v) => setRecord({ ...record, nextReview: v })} width={150} />
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 18, marginBottom: 10, fontFamily: SANS, fontSize: 12.5 }}>
+          <label>Payroll Verified:&nbsp;
+            <select value={record.payrollVerified} onChange={(e) => setRecord({ ...record, payrollVerified: e.target.value })} style={{ fontFamily: SANS, fontSize: 12.5 }}>
+              <option value="">—</option><option value="Yes">Yes</option><option value="No">No</option>
+            </select>
+          </label>
+          <label>Action Required:&nbsp;
+            <select value={record.actionRequired} onChange={(e) => setRecord({ ...record, actionRequired: e.target.value })} style={{ fontFamily: SANS, fontSize: 12.5 }}>
+              <option value="">—</option><option value="Yes">Yes</option><option value="No">No</option>
+            </select>
+          </label>
+        </div>
+        <textarea
+          value={record.notes}
+          onChange={(e) => setRecord({ ...record, notes: e.target.value })}
+          placeholder="Notes"
+          rows={2}
+          style={{ width: "100%", fontFamily: SANS, fontSize: 12.5, padding: "7px 9px", borderRadius: 4, border: `1px solid ${C.border}`, resize: "vertical", marginBottom: 10 }}
+        />
+        <p style={{ fontFamily: SANS, fontSize: 11.5, color: C.textFaint, marginBottom: 8 }}>
+          Snapshot at save — Highest Applicable: {money(result.highestApplicable)} · Job Order: {money(result.jobOrderRate)} · Required: {money(result.requiredWage)} · Actual: {money(result.actualRate)} · Status: {result.status}
+        </p>
+        <button onClick={saveReview} style={{ fontFamily: SANS, fontSize: 12.5, fontWeight: 600, padding: "7px 16px", borderRadius: 4, border: "none", background: C.navy, color: "#fff", cursor: "pointer" }}>
+          Save Review Record
+        </button>
+      </div>
+
+      {t.reviews.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
+          {t.reviews.map((r) => (
+            <div key={r.id} style={{ background: C.surface, border: `1px solid ${C.border}`, borderLeft: `3px solid ${WAGE_STATUS_STYLE[r.status].fg}`, borderRadius: 6, padding: "10px 14px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontFamily: SANS, fontSize: 12.5, fontWeight: 700, color: C.text }}>{r.date} {r.reviewedBy && `— ${r.reviewedBy}`}</span>
+                <button onClick={() => removeReview(r.id)} style={{ background: "none", border: "none", color: C.textFaint, fontSize: 11, cursor: "pointer", fontFamily: SANS }}>remove</button>
+              </div>
+              <p style={{ fontFamily: SANS, fontSize: 11.5, color: C.textSoft, margin: "4px 0" }}>
+                Required {money(r.requiredWage)} · Actual {money(r.actualRate)} · Payroll verified: {r.payrollVerified || "—"} · Action required: {r.actionRequired || "—"} · Next review: {r.nextReview || "—"}
+              </p>
+              {r.notes && <p style={{ fontFamily: SANS, fontSize: 12, color: C.text, margin: "4px 0 0" }}>{r.notes}</p>}
+              <Chip bg={WAGE_STATUS_STYLE[r.status].bg} fg={WAGE_STATUS_STYLE[r.status].fg} small>{r.status}</Chip>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <p style={{ fontFamily: SANS, fontSize: 12, color: C.textSoft, marginBottom: 4 }}>
+        Applies to H-2A workers and workers in corresponding employment.{" "}
+        <button onClick={() => setView("corresponding")} style={{ background: "none", border: "none", color: C.blue, cursor: "pointer", fontFamily: SANS, fontSize: 12, padding: 0 }}>
+          See Corresponding Employment ↗
+        </button>
+      </p>
+
+      {/* LEGAL FRAMEWORK — collapsed by default */}
+      <Divider />
+      <button
+        onClick={() => setLegalOpen((o) => !o)}
+        style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: SANS, fontSize: 12, fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase", color: C.navy, display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}
+      >
+        <span style={{ fontSize: 10 }}>{legalOpen ? "▾" : "▸"}</span> Legal Framework
+      </button>
+      {legalOpen && (
+        <div>
+          <div style={{ maxWidth: 340, marginBottom: 18 }}>
+            <HierarchyColumn
+              title="Wage Authority Chain"
+              color={C.navy}
+              steps={["H-2A / INA Authority", "20 CFR Part 655, Subpart B", "H-2A Wage Requirements / Job Order", "DOL", "ETA / OFLC", "AEWR + Applicable Prevailing Wage", "General Federal / State / Local Wage Floors", "Actual Payroll", "Compliance Review"]}
+            />
+          </div>
+          <p style={{ fontFamily: SANS, fontSize: 12.5, color: C.textSoft, marginBottom: 12, lineHeight: 1.55 }}>
+            Per 20 CFR 655.122(l), H-2A employers must pay H-2A workers and workers in corresponding employment the highest of: the AEWR, the applicable prevailing wage or piece rate, an agreed collective bargaining rate (if any), or the applicable federal/state/local minimum wage. MSPA is not itself a wage-rate input here — it remains part of the broader migrant/seasonal worker protection framework (disclosure, wage-payment, recordkeeping, housing, transportation, farm labor contractor requirements) shown below and in the Migrant / Seasonal Employment section.
+          </p>
+          <IntersectionList lawIds={TOPICS.wages.laws} data={data} persist={persist} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ---------------------------- SEARCH ---------------------------- */
 
 function searchAll(query) {
   const q = query.trim().toLowerCase();
   if (!q) return [];
   const results = [];
+  if ("wage compliance tracker".includes(q) || "aewr".includes(q) || q.includes("wage") || q.includes("aewr") || q.includes("prevailing")) {
+    results.push({ type: "Tool", id: "wage-tracker", label: "Wage Compliance Tracker", view: "wage-tracker", meta: "AEWR / prevailing wage / job order check" });
+  }
   Object.values(LAWS).forEach((l) => {
     const hay = [l.name, l.statute, l.regulation, l.purpose].join(" ").toLowerCase();
     if (hay.includes(q)) results.push({ type: "Legal Framework", id: l.id, label: l.name, view: "law-lookup", meta: AGENCIES[l.agencies?.[0]]?.short });
@@ -1876,6 +2204,7 @@ function SearchOverlay({ query, setQuery, onNavigate, onClose }) {
 const NAV = [
   { section: "Start", items: [["home", "Home"], ["worker-types", "Who Is The Worker?"], ["topics", "What Issue?"]] },
   { section: "Maps & Views", items: [["ecosystem", "H-2A Legal Ecosystem"], ["lifecycle", "Workforce Lifecycle"], ["agencies", "Agency Map"], ["jurisdiction", "Federal / Minnesota / Local"], ["matrix", "Legal Interaction Matrix"], ["complexity", "Why H-2A HR Is Complex"]] },
+  { section: "Wages & Compensation", items: [["wage-tracker", "Wage Compliance Tracker"]] },
   { section: "Dedicated Topics", items: [["corresponding", "Corresponding Employment"], ["migrant-seasonal", "Migrant / Seasonal Employment"]] },
   { section: "Resources", items: [["resources", "Forms, Notices & Posters"], ["interview", "Explain This In An Interview"]] },
   { section: "My Workspace", items: [["bookmarks", "Bookmarks"], ["research-queue", "To Verify"]] },
@@ -1905,6 +2234,7 @@ export default function App() {
   else if (view === "jurisdiction") content = <JurisdictionView data={data} persist={persist} />;
   else if (view === "matrix") content = <MatrixView data={data} persist={persist} />;
   else if (view === "complexity") content = <ComplexityMapView setView={setView} />;
+  else if (view === "wage-tracker") content = <WagesComplianceView data={data} persist={persist} setView={setView} />;
   else if (view === "corresponding") content = <CorrespondingEmploymentView data={data} persist={persist} />;
   else if (view === "migrant-seasonal") content = <MigrantSeasonalView data={data} persist={persist} />;
   else if (view === "resources") content = <ResourcesView data={data} persist={persist} />;
